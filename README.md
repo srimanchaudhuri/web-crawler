@@ -6,16 +6,20 @@ A small web crawler built from scratch in Python as a learning project.
 
 ### Phase 1: Single-threaded fetcher - complete
 
-- Fetches HTML with `requests`
-- Parses HTML with `selectolax`
-- Extracts links from `<a>` elements
-- Resolves relative links with `urllib.parse.urljoin`
-- Follows redirects by using the final response URL as the base URL
-- Applies a 10-second request timeout
+This milestone is complete and marks the end of the initial HTTP + HTML basics phase.
 
-The crawler currently fetches the configured starting page and prints each
-resolved link. It does not yet crawl linked pages, deduplicate URLs, or handle
-robots.txt; those are planned for later phases.
+Covered:
+
+- Fetching a page with `requests`
+- Inspecting HTTP response metadata such as status code, headers, encoding, and elapsed time
+- Parsing HTML with `selectolax`
+- Extracting links from `<a>` tags
+- Resolving relative URLs correctly with `urllib.parse.urljoin`
+- Testing multiple sites and handling non-200 responses intentionally
+
+The crawler currently fetches one or more configured starting pages and prints
+resolved links. It does not yet crawl across discovered pages, deduplicate URLs,
+or handle robots.txt; those belong to Phase 2.
 
 ## Setup
 
