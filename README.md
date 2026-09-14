@@ -21,6 +21,23 @@ The crawler currently fetches one or more configured starting pages and prints
 resolved links. It does not yet crawl across discovered pages, deduplicate URLs,
 or handle robots.txt; those belong to Phase 2.
 
+### Phase 2: Sequential BFS crawler - in progress
+
+The project has moved beyond single-page fetching and now includes the core
+structure of a queue-based crawler:
+
+- breadth-first traversal with `collections.deque`
+- URL normalization and canonicalization before deduplication
+- `visited` and `queued` sets to avoid reprocessing the same page
+- same-host filtering for basic crawl scope control
+- link extraction from discovered pages
+- robots.txt integration hook for crawl policy checks
+
+This is the Phase 2 baseline: a sequential crawler that explores a site frontier
+without re-fetching already scheduled or processed pages. It still needs
+additional hardening for full robots.txt compliance, stricter response handling,
+and bounded crawl limits before it is considered fully complete.
+
 ## Setup
 
 Install dependencies with [uv](https://docs.astral.sh/uv/):
