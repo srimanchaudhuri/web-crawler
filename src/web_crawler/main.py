@@ -45,6 +45,13 @@ async def get_link_tree(
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
                 headers={'User-Agent': USER_AGENT},
             ) as res:
+                final_url = str(res.url)
+                if robot_parser.can_fetch('*', final_url) is False:
+                    print(f'Redirected to disallowed URL {final_url} — skipping')
+                    return None, None
+                if urlsplit(final_url).path == '/robots.txt':
+                    return None, None
+
                 if res.status != 200 or not res.headers.get('Content-Type', '').startswith('text/html'):
                     print(f'Error fetching {url}: Status code {res.status}, '
                           f'Content-Type {res.headers.get("Content-Type")}')
@@ -128,7 +135,7 @@ async def get_robots(host: str) -> RobotFileParser:
                 rp.parse(text.splitlines())
         except aiohttp.ClientError as e:
             print(f'Could not fetch robots.txt for {host}: {e} — treating as fully allowed')
-            rp.parse([])  # no rules parsed -> allow_all/disallow_all stay False
+            rp.parse([])  
     return rp
 
 
