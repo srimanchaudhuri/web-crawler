@@ -8,9 +8,12 @@ from collections import deque
 from urllib.robotparser import RobotFileParser
 
 from utils.normalize_url import normalize_url
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
+
+from web_crawler.exception import NonRetryableError, RateLimitedError, RetryableError
 
 site_url_1 = 'https://www.scrapethissite.com/pages'
-MAX_LINKS = 500
+MAX_LINKS = 10000
 MAX_CONCURRENT_REQUESTS = 20
 REQUEST_TIMEOUT = 5
 
@@ -19,6 +22,41 @@ USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
+async def _fetch(session: aiohttp.ClientSession, url: str, robot_parser: RobotFileParser) -> tuple[LexborHTMLParser, aiohttp.ClientResponse] | tuple[None, None]:
+    async with session.get(
+        url,
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        headers={'User-Agent': USER_AGENT},
+    ) as res:
+        final_url = str(res.url)
+        if robot_parser.can_fetch('*', final_url) is False:
+            return None, None
+        if urlsplit(final_url).path == '/robots.txt':
+            return None, None
+
+        if res.status == 429:
+            retry_after = res.headers.get('Retry-After')
+            raise RateLimitedError(float(retry_after) if retry_after else None)
+
+        if 500 <= res.status < 600:
+            raise RetryableError(f'{res.status} from {url}')
+
+        if res.status != 200 or not res.headers.get('Content-Type', '').startswith('text/html'):
+            # 400, 404, wrong content-type, etc. — permanent, don't retry
+            raise NonRetryableError(f'{res.status} from {url}')
+
+        text = await res.text()
+        return LexborHTMLParser(text), res
+             
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential_jitter(initial=1, max=10),
+    retry=retry_if_exception_type((RetryableError, aiohttp.ClientError, asyncio.TimeoutError)),
+    reraise=True
+)
+async def fetch_with_retry(session: aiohttp.ClientSession, url: str, robot_parser: RobotFileParser) -> tuple[LexborHTMLParser, aiohttp.ClientResponse]:
+        async with semaphore:
+            return await _fetch(session, url, robot_parser)
 
 async def get_link_tree(
     session: aiohttp.ClientSession,
@@ -38,32 +76,28 @@ async def get_link_tree(
 
     url = normalize_url(url)
 
-    try:
-        async with semaphore:
-            async with session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                headers={'User-Agent': USER_AGENT},
-            ) as res:
-                final_url = str(res.url)
-                if robot_parser.can_fetch('*', final_url) is False:
-                    print(f'Redirected to disallowed URL {final_url} — skipping')
-                    return None, None
-                if urlsplit(final_url).path == '/robots.txt':
-                    return None, None
+    max_retries = 0
+    while True and max_retries < 3:
+        try:
+            html, res = await fetch_with_retry(session, url, robot_parser)
+            return html, res
+        except RateLimitedError as e:
+            retry_after = e.retry_after
+            max_retries += 1
+            if retry_after is not None:
+                print(f"Rate limited on {url}, retrying after {retry_after} seconds")
+                await asyncio.sleep(retry_after)
+            else:
+                print(f"Rate limited on {url}, retrying after 1 second")
+                await asyncio.sleep(1)
+        except NonRetryableError as e:
+            print(f'Not retrying {url}: {e}')
+            return None, None
+        except (RetryableError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f'Gave up on {url} after retries: {e}')
+            return None, None
 
-                if res.status != 200 or not res.headers.get('Content-Type', '').startswith('text/html'):
-                    print(f'Error fetching {url}: Status code {res.status}, '
-                          f'Content-Type {res.headers.get("Content-Type")}')
-                    return None, None
-                text = await res.text()
-                return LexborHTMLParser(text), res
-    except aiohttp.ClientError as e:
-        print(f'Network error fetching {url}: {e}')
-        return None, None
-    except asyncio.TimeoutError:
-        print(f'Timed out fetching {url}')
-        return None, None
+    return None, None
 
 
 def extract_links_from_page(html: LexborHTMLParser, base_url: str) -> list[str]:

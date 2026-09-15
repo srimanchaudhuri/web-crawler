@@ -36,7 +36,7 @@ structure of a queue-based crawler:
 This milestone established the crawler frontier, URL policy, and deduplication
 behavior used by the async implementation.
 
-### Phase 3: Async crawler - mostly complete
+### Phase 3: Async crawler - complete
 
 The crawler now uses `asyncio` and `aiohttp` for concurrent I/O-bound fetching:
 
@@ -49,9 +49,23 @@ The crawler now uses `asyncio` and `aiohttp` for concurrent I/O-bound fetching:
 - request timeouts and network error handling
 - a configurable User-Agent header
 
-The core Phase 3 implementation is working. Timing comparisons between the
-sequential and async crawlers, plus retry/backoff behavior, are intentionally
-left for the later performance and resilience checkpoints.
+This baseline established the concurrent crawl loop and queue discipline for the
+project.
+
+### Phase 4: Resilience and retry policy - complete
+
+The crawler now includes operational safeguards for real-world site behavior:
+
+- explicit retryable vs non-retryable exception types
+- `tenacity` backoff with jitter for transient 5xx and network failures
+- `429 Too Many Requests` handling with optional `Retry-After` support
+- graceful rate-limit pauses without crashing the crawl
+- robots.txt enforcement before fetching a page
+- skip logic for malformed links and disallowed paths
+- bounded page caps and host-scoped BFS traversal
+
+This phase focuses on making the crawler robust enough to keep crawling under
+realistic failures instead of silently stopping at the first error.
 
 ## Setup
 
@@ -69,7 +83,9 @@ uv run python -m web_crawler.main
 
 ## Roadmap
 
-1. Politeness, retries, and resilience
-2. SQLite storage and resumable state
-3. Performance benchmarking and tuning
-4. Multi-process crawling and scope control
+1. SQLite storage and resumable state
+2. Performance benchmarking and tuning
+3. Multi-process crawling and scope control
+4. Distributed crawling and richer scheduling policies
+
+The original resilience work is now complete as part of Phase 4.
