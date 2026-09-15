@@ -21,7 +21,7 @@ The crawler currently fetches one or more configured starting pages and prints
 resolved links. It does not yet crawl across discovered pages, deduplicate URLs,
 or handle robots.txt; those belong to Phase 2.
 
-### Phase 2: Sequential BFS crawler - in progress
+### Phase 2: Sequential BFS crawler - complete
 
 The project has moved beyond single-page fetching and now includes the core
 structure of a queue-based crawler:
@@ -33,10 +33,25 @@ structure of a queue-based crawler:
 - link extraction from discovered pages
 - robots.txt integration hook for crawl policy checks
 
-This is the Phase 2 baseline: a sequential crawler that explores a site frontier
-without re-fetching already scheduled or processed pages. It still needs
-additional hardening for full robots.txt compliance, stricter response handling,
-and bounded crawl limits before it is considered fully complete.
+This milestone established the crawler frontier, URL policy, and deduplication
+behavior used by the async implementation.
+
+### Phase 3: Async crawler - mostly complete
+
+The crawler now uses `asyncio` and `aiohttp` for concurrent I/O-bound fetching:
+
+- shared `aiohttp.ClientSession` for connection reuse
+- `asyncio.Semaphore(20)` to bound concurrent requests
+- task-based batch processing with `asyncio.gather`
+- async BFS traversal with a maximum crawl size
+- async robots.txt loading and crawl-delay support
+- HTTP status and HTML content-type checks
+- request timeouts and network error handling
+- a configurable User-Agent header
+
+The core Phase 3 implementation is working. Timing comparisons between the
+sequential and async crawlers, plus retry/backoff behavior, are intentionally
+left for the later performance and resilience checkpoints.
 
 ## Setup
 
@@ -54,9 +69,7 @@ uv run python -m web_crawler.main
 
 ## Roadmap
 
-1. Sequential crawling with URL deduplication and robots.txt support
-2. Async crawling with `asyncio` and `aiohttp`
-3. Politeness, retries, and resilience
-4. SQLite storage and resumable state
-5. Performance benchmarking and tuning
-6. Multi-process crawling and scope control
+1. Politeness, retries, and resilience
+2. SQLite storage and resumable state
+3. Performance benchmarking and tuning
+4. Multi-process crawling and scope control

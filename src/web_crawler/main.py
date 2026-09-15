@@ -1,128 +1,147 @@
-from functools import lru_cache
-import time
+import asyncio
+import aiohttp
+from async_lru import alru_cache
 
-import requests
-from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit
 from selectolax.lexbor import LexborHTMLParser
 from collections import deque
 from urllib.robotparser import RobotFileParser
 
-example_url = 'https://www.Example.com:443/path/../folder?b=2&a=1&c=&x=7#section-2'
+from utils.normalize_url import normalize_url
+
 site_url_1 = 'https://www.scrapethissite.com/pages'
-site_url_2 = 'https://books.toscrape.com'
-site_url_3 = 'https://quotes.toscrape.com'
-site_url_4 = 'https://httpbin.org/status/403'
-site_url_5 = 'https://httpbin.org/status/411'
-site_url_6 = 'https://httpbin.org/status/404'
-site_url_7 = 'https://httpbin.org/status/500'
-DEFAULT_PORTS = {'http': 80, 'https': 443}
 MAX_LINKS = 500
+MAX_CONCURRENT_REQUESTS = 20
+REQUEST_TIMEOUT = 5
 
-def get_link_tree(url: str, crawl_delay: float | None) -> tuple[LexborHTMLParser, requests.Response]:
-    try:
-        if crawl_delay is not None:
-            time.sleep(crawl_delay)
-        url = normalize_url(url)
-        r = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'})
-        if r.status_code != 200 or not r.headers.get('Content-Type', '').startswith('text/html'):
-            print(f'Error fetching {url}: Status code {r.status_code}, Content-Type {r.headers.get("Content-Type")}')
-            return LexborHTMLParser(''), r
-        return LexborHTMLParser(r.text), r
-    except requests.exceptions.RequestException as e:
-        print(f'Error fetching {url}: {e}')
-        return LexborHTMLParser(''), None
+USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3')
 
-def normalize_path(path: str) -> str:
-    segments = path.split('/')
-    normalized_segments = []
-    for segment in segments:
-        if segment == '..':
-            if normalized_segments:
-                normalized_segments.pop()
-        elif segment == '.' or segment == '':
-            continue
-        else:
-            normalized_segments.append(segment)
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-    return '/' + '/'.join(normalized_segments)
 
-def normalize_query(query: str) -> str:
-    query_params = parse_qs(query, keep_blank_values=True)
-    sorted_params = sorted((key, value) for key, values in query_params.items() for value in values)
-    return urlencode(sorted_params)
+async def get_link_tree(
+    session: aiohttp.ClientSession,
+    url: str,
+    robot_parser: RobotFileParser,
+) -> tuple[LexborHTMLParser, aiohttp.ClientResponse] | tuple[None, None]:
+    if urlsplit(url).path == '/robots.txt':
+        return None, None
 
-def normalize_url(url: str) -> str:
-    url_parts = urlsplit(url)
-    scheme = url_parts.scheme.lower()
-    host = url_parts.hostname.lower() if url_parts.hostname else ''
-    port = url_parts.port
-    if port is not None and port == DEFAULT_PORTS.get(scheme):
-        port = None    
-    path = normalize_path(url_parts.path)
-    query = normalize_query(url_parts.query)
-    normalized_url = scheme + '://' + host
-    if port:
-        normalized_url += ':' + str(port)
-    normalized_url += path
-    if query:
-        normalized_url += '?' + query
-    return normalized_url
-
-def print_metadata(response: requests.Response):
-    print('\n\n--- Response Metadata ---\n\n')
-    print(f'URL: {response.url}')
-    print(f'Status Code: {response.status_code}')
-    print(f'Content-Type: {response.headers.get("Content-Type")}')
-    print(f'Content-Encoding: {response.headers.get("Content-Encoding")}')
-    print(f'Encoding: {response.encoding}')
-    print(f'Elapsed Time: {response.elapsed.total_seconds()} seconds')
-    print(f'Response Headers: {response.headers}')
-
-def link_bfs(url: str, host: str, robot_parser: RobotFileParser) -> list[str]:
-    if not robot_parser.can_fetch('*', url):
+    if robot_parser.can_fetch('*', url) is False:
         print(f"Access to {url} is disallowed by robots.txt")
+        return None, None
+
+    delay = robot_parser.crawl_delay('*')
+    if delay is not None:
+        await asyncio.sleep(delay)
+
+    url = normalize_url(url)
+
+    try:
+        async with semaphore:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                headers={'User-Agent': USER_AGENT},
+            ) as res:
+                if res.status != 200 or not res.headers.get('Content-Type', '').startswith('text/html'):
+                    print(f'Error fetching {url}: Status code {res.status}, '
+                          f'Content-Type {res.headers.get("Content-Type")}')
+                    return None, None
+                text = await res.text()
+                return LexborHTMLParser(text), res
+    except aiohttp.ClientError as e:
+        print(f'Network error fetching {url}: {e}')
+        return None, None
+    except asyncio.TimeoutError:
+        print(f'Timed out fetching {url}')
+        return None, None
+
+
+def extract_links_from_page(html: LexborHTMLParser, base_url: str) -> list[str]:
+    links = []
+    for node in html.css('a'):
+        href = node.attributes.get('href')
+        if not href:
+            continue
+        try:
+            links.append(normalize_url(urljoin(base_url, href)))
+        except Exception as e:
+            print(f'Skipping malformed link on {base_url}: {href!r} ({e})')
+    return links
+
+
+async def link_bfs(
+    session: aiohttp.ClientSession,
+    seed_url: str,
+    host: str,
+    robot_parser: RobotFileParser,
+) -> list[str]:
+    if not robot_parser.can_fetch('*', seed_url):
+        print(f"Access to {seed_url} is disallowed by robots.txt")
         return []
-    queue = deque([normalize_url(url)])
-    visited = set()
-    queued = set()
-    extracted_links = []
 
-    while queue and len(extracted_links) < MAX_LINKS:
-        current_url = queue.popleft()
-        if current_url in visited:
-            continue
-        visited.add(current_url)
-        links, r = get_link_tree(current_url, robot_parser.crawl_delay('*'))
-        if r is None or r.status_code != 200 or not r.headers.get('Content-Type', '').startswith('text/html'):
-            continue
-        extracted_links.append(current_url)
-        for link in links.css('a'):
-            href = link.attributes.get('href')
-            if href:
-                absolute_url = urljoin(current_url, href)
-                absolute_url = normalize_url(absolute_url)
-                if absolute_url not in visited and absolute_url not in queued and urlsplit(absolute_url).hostname == host and robot_parser.can_fetch('*', absolute_url) and urlsplit(absolute_url).path != '/robots.txt':
-                    queue.append(absolute_url)
-                    queued.add(absolute_url)
+    queue: deque[asyncio.Task] = deque(
+        [asyncio.create_task(get_link_tree(session, normalize_url(seed_url), robot_parser))]
+    )
+    visited: set[str] = set()
+    queued: set[str] = set()
 
-    return extracted_links
+    while queue and len(visited) < MAX_LINKS:
+        batch = list(queue)
+        queue.clear()
+        results = await asyncio.gather(*batch)
 
-@lru_cache(maxsize=32)
-def get_robots(url: str) -> RobotFileParser:
+        for html, res in results:
+            if html is None or res is None:
+                continue
+
+            page_url = normalize_url(str(res.url))
+            visited.add(page_url)
+
+            for link in extract_links_from_page(html, str(res.url)):
+                if (
+                    link not in visited
+                    and link not in queued
+                    and urlsplit(link).hostname == host
+                    and len(visited) + len(queued) < MAX_LINKS
+                ):
+                    queued.add(link)
+                    queue.append(asyncio.create_task(get_link_tree(session, link, robot_parser)))
+
+    return list(visited)[:MAX_LINKS]
+
+
+@alru_cache(maxsize=32)
+async def get_robots(host: str) -> RobotFileParser:
     rp = RobotFileParser()
-    res = requests.get(urljoin(url, '/robots.txt'), headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'})
-    rp.parse(res.text.splitlines())
+    robots_url = f'https://{host}/robots.txt'
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(
+                robots_url,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                headers={'User-Agent': USER_AGENT},
+            ) as res:
+                text = await res.text()
+                rp.parse(text.splitlines())
+        except aiohttp.ClientError as e:
+            print(f'Could not fetch robots.txt for {host}: {e} — treating as fully allowed')
+            rp.parse([])  # no rules parsed -> allow_all/disallow_all stay False
     return rp
 
-def main():
-    try:
-        rp = get_robots(site_url_1)
-        extracted_links = link_bfs(site_url_1, urlsplit(site_url_1).hostname, rp)
-        print(f'Extracted {len(extracted_links)} links from {site_url_1}:')
-        for link in extracted_links:
-            print(link)
-    except Exception as e:
-        print(f"An error occurred: {e}")
+
+async def main():
+    host = urlsplit(site_url_1).hostname
+    rp = await get_robots(host)
+    async with aiohttp.ClientSession() as session:
+        results = await link_bfs(session, site_url_1, host, rp)
+
+    print(f"Found {len(results)} links on {site_url_1}:")
+    for link in results:
+        print(link)
+
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
