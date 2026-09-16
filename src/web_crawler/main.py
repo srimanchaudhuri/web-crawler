@@ -1,6 +1,13 @@
 import asyncio
+import datetime
+from enum import Enum
+from pathlib import Path
+import sqlite3
+import threading
+import time
 import aiohttp
 from async_lru import alru_cache
+from concurrent.futures import ThreadPoolExecutor
 
 from urllib.parse import urljoin, urlsplit
 from selectolax.lexbor import LexborHTMLParser
@@ -16,11 +23,43 @@ site_url_1 = 'https://www.scrapethissite.com/pages'
 MAX_LINKS = 10000
 MAX_CONCURRENT_REQUESTS = 20
 REQUEST_TIMEOUT = 5
+DB_PATH = Path("data/crawler.db")
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+_local = threading.local()
+
+class Status(Enum):
+    processing = "processing"
+    queued = "queued"
+    processed = "processed"
+    failed = "failed"
 
 USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
               '(KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3')
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+def _get_connection() -> sqlite3.Connection:
+    if not hasattr(_local, "connection"):
+        _local.connection = sqlite3.connect(DB_PATH)
+    return _local.connection
+
+def _write_metadata_sync(url: str, status_code: int | None,  timestamp: str, status: Status):
+    conn = _get_connection()
+    c = conn.cursor()
+    with conn:
+        c.execute("""
+            INSERT INTO metadata (url, status_code, fetched_timestamp, status) VALUES (:url, :status_code, :fetched_timestamp, :status)
+            ON CONFLICT(url)
+            DO UPDATE SET 
+            fetched_timestamp = excluded.fetched_timestamp,
+            status = excluded.status,
+            status_code = excluded.status_code
+        """,  {"url": url, "status_code": status_code, "fetched_timestamp": timestamp, "status": status.value})
+
+async def write_metadata(loop: asyncio.AbstractEventLoop, executor: ThreadPoolExecutor, url: str, status_code: int | None,  timestamp: str, status: str):
+    await loop.run_in_executor(executor, _write_metadata_sync, url, status_code, timestamp, status)
+
 
 async def _fetch(session: aiohttp.ClientSession, url: str, robot_parser: RobotFileParser) -> tuple[LexborHTMLParser, aiohttp.ClientResponse] | tuple[None, None]:
     async with session.get(
@@ -39,11 +78,10 @@ async def _fetch(session: aiohttp.ClientSession, url: str, robot_parser: RobotFi
             raise RateLimitedError(float(retry_after) if retry_after else None)
 
         if 500 <= res.status < 600:
-            raise RetryableError(f'{res.status} from {url}')
+            raise RetryableError(f'{res.status} from {url}', res.status)
 
         if res.status != 200 or not res.headers.get('Content-Type', '').startswith('text/html'):
-            # 400, 404, wrong content-type, etc. — permanent, don't retry
-            raise NonRetryableError(f'{res.status} from {url}')
+            raise NonRetryableError(f'{res.status} from {url}', res.status)
 
         text = await res.text()
         return LexborHTMLParser(text), res
@@ -62,6 +100,8 @@ async def get_link_tree(
     session: aiohttp.ClientSession,
     url: str,
     robot_parser: RobotFileParser,
+    executor: ThreadPoolExecutor,
+    loop: asyncio.AbstractEventLoop
 ) -> tuple[LexborHTMLParser, aiohttp.ClientResponse] | tuple[None, None]:
     if urlsplit(url).path == '/robots.txt':
         return None, None
@@ -79,7 +119,9 @@ async def get_link_tree(
     max_retries = 0
     while True and max_retries < 3:
         try:
+            await write_metadata(loop, executor, url, None, str(datetime.datetime.now()), Status.processing)
             html, res = await fetch_with_retry(session, url, robot_parser)
+            await write_metadata(loop, executor, url, res.status, str(datetime.datetime.now()), Status.processed)
             return html, res
         except RateLimitedError as e:
             retry_after = e.retry_after
@@ -92,11 +134,14 @@ async def get_link_tree(
                 await asyncio.sleep(1)
         except NonRetryableError as e:
             print(f'Not retrying {url}: {e}')
+            await write_metadata(loop, executor, url, e.status_code, str(datetime.datetime.now()), Status.failed)
             return None, None
         except (RetryableError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(f'Gave up on {url} after retries: {e}')
+            print(f'Gave up on {url} after 3 retries: {e}')
+            await write_metadata(loop, executor, url, e.status_code, str(datetime.datetime.now()), Status.failed)
             return None, None
 
+    await write_metadata(loop, executor, url, 429, str(datetime.datetime.now()), Status.failed)
     return None, None
 
 
@@ -118,13 +163,15 @@ async def link_bfs(
     seed_url: str,
     host: str,
     robot_parser: RobotFileParser,
+    executor: ThreadPoolExecutor,
+    loop: asyncio.AbstractEventLoop
 ) -> list[str]:
     if not robot_parser.can_fetch('*', seed_url):
         print(f"Access to {seed_url} is disallowed by robots.txt")
         return []
 
     queue: deque[asyncio.Task] = deque(
-        [asyncio.create_task(get_link_tree(session, normalize_url(seed_url), robot_parser))]
+        [asyncio.create_task(get_link_tree(session, normalize_url(seed_url), robot_parser, executor, loop))]
     )
     visited: set[str] = set()
     queued: set[str] = set()
@@ -149,7 +196,9 @@ async def link_bfs(
                     and len(visited) + len(queued) < MAX_LINKS
                 ):
                     queued.add(link)
-                    queue.append(asyncio.create_task(get_link_tree(session, link, robot_parser)))
+                    queue.append(asyncio.create_task(get_link_tree(session, link, robot_parser, executor, loop)))
+                    await write_metadata(loop, executor, link, None, str(datetime.datetime.now()), Status.queued)
+
 
     return list(visited)[:MAX_LINKS]
 
@@ -174,14 +223,15 @@ async def get_robots(host: str) -> RobotFileParser:
 
 
 async def main():
+    loop = asyncio.get_running_loop()
+    db_executor = ThreadPoolExecutor(max_workers=1)
+
     host = urlsplit(site_url_1).hostname
     rp = await get_robots(host)
     async with aiohttp.ClientSession() as session:
-        results = await link_bfs(session, site_url_1, host, rp)
+        await link_bfs(session, site_url_1, host, rp, db_executor, loop)
 
-    print(f"Found {len(results)} links on {site_url_1}:")
-    for link in results:
-        print(link)
+    db_executor.shutdown(wait=True)
 
 
 if __name__ == '__main__':
