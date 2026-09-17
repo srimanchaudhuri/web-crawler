@@ -20,6 +20,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from web_crawler.exception import NonRetryableError, RateLimitedError, RetryableError
 
 site_url_1 = 'https://www.scrapethissite.com/pages'
+tags_to_strip = ['script', 'style', 'noscript', 'svg', 'iframe', 'template']
 MAX_LINKS = 10000
 MAX_CONCURRENT_REQUESTS = 20
 REQUEST_TIMEOUT = 5
@@ -42,9 +43,10 @@ semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 def _get_connection() -> sqlite3.Connection:
     if not hasattr(_local, "connection"):
         _local.connection = sqlite3.connect(DB_PATH)
+        _local.connection.execute("PRAGMA foreign_keys = ON")
     return _local.connection
 
-def _write_metadata_sync(url: str, status_code: int | None,  timestamp: str, status: Status):
+def _write_metadata_sync(url: str, status_code: int | None, timestamp: str, status: Status) -> int:
     conn = _get_connection()
     c = conn.cursor()
     with conn:
@@ -52,13 +54,33 @@ def _write_metadata_sync(url: str, status_code: int | None,  timestamp: str, sta
             INSERT INTO metadata (url, status_code, fetched_timestamp, status) VALUES (:url, :status_code, :fetched_timestamp, :status)
             ON CONFLICT(url)
             DO UPDATE SET 
-            fetched_timestamp = excluded.fetched_timestamp,
-            status = excluded.status,
-            status_code = excluded.status_code
+                fetched_timestamp = excluded.fetched_timestamp,
+                status = excluded.status,
+                status_code = excluded.status_code
+            RETURNING id;
         """,  {"url": url, "status_code": status_code, "fetched_timestamp": timestamp, "status": status.value})
 
-async def write_metadata(loop: asyncio.AbstractEventLoop, executor: ThreadPoolExecutor, url: str, status_code: int | None,  timestamp: str, status: str):
-    await loop.run_in_executor(executor, _write_metadata_sync, url, status_code, timestamp, status)
+        result = c.fetchone()
+        row_id = result[0] if result else None
+
+    return row_id
+
+async def write_metadata(loop: asyncio.AbstractEventLoop, executor: ThreadPoolExecutor, url: str, status_code: int | None, timestamp: str, status: str) -> int:
+    return await loop.run_in_executor(executor, _write_metadata_sync, url, status_code, timestamp, status)
+
+def _write_data_sync(metadata_id: str, content: str):
+    conn = _get_connection()
+    c = conn.cursor()
+    with conn:
+        c.execute("""
+            INSERT INTO data (metadata_id, content) VALUES (:metadata_id, :content)
+            ON CONFLICT(metadata_id)
+            DO UPDATE SET 
+            content = excluded.content
+        """,  {"metadata_id": metadata_id, "content": content})
+
+async def write_data(loop: asyncio.AbstractEventLoop, executor: ThreadPoolExecutor, metadata_id: str, content: str):
+    await loop.run_in_executor(executor, _write_data_sync, metadata_id, content)
 
 
 async def _fetch(session: aiohttp.ClientSession, url: str, robot_parser: RobotFileParser) -> tuple[LexborHTMLParser, aiohttp.ClientResponse] | tuple[None, None]:
@@ -85,7 +107,7 @@ async def _fetch(session: aiohttp.ClientSession, url: str, robot_parser: RobotFi
 
         text = await res.text()
         return LexborHTMLParser(text), res
-             
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential_jitter(initial=1, max=10),
@@ -121,8 +143,21 @@ async def get_link_tree(
         try:
             await write_metadata(loop, executor, url, None, str(datetime.datetime.now()), Status.processing)
             html, res = await fetch_with_retry(session, url, robot_parser)
-            await write_metadata(loop, executor, url, res.status, str(datetime.datetime.now()), Status.processed)
+
+            # NEW: guard against _fetch's clean (None, None) return
+            # (robots-disallowed redirect target, or a redirect landing on /robots.txt)
+            if html is None or res is None:
+                return None, None
+
+            id = await write_metadata(loop, executor, url, res.status, str(datetime.datetime.now()), Status.processed)
+
+            html_copy = html.clone()
+            html_copy.strip_tags(tags_to_strip)
+            clean_text = html_copy.text(separator=" ", strip=True)
+            content = " ".join(clean_text.split())
+            await write_data(loop, executor, id, content)
             return html, res
+
         except RateLimitedError as e:
             retry_after = e.retry_after
             max_retries += 1
@@ -156,7 +191,6 @@ def extract_links_from_page(html: LexborHTMLParser, base_url: str) -> list[str]:
         except Exception as e:
             print(f'Skipping malformed link on {base_url}: {href!r} ({e})')
     return links
-
 
 async def link_bfs(
     session: aiohttp.ClientSession,
@@ -218,7 +252,7 @@ async def get_robots(host: str) -> RobotFileParser:
                 rp.parse(text.splitlines())
         except aiohttp.ClientError as e:
             print(f'Could not fetch robots.txt for {host}: {e} — treating as fully allowed')
-            rp.parse([])  
+            rp.parse([])
     return rp
 
 
