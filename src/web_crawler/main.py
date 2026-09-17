@@ -14,6 +14,7 @@ from selectolax.lexbor import LexborHTMLParser
 from collections import deque
 from urllib.robotparser import RobotFileParser
 
+from dbup.init_db import init_db
 from utils.normalize_url import normalize_url
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
@@ -26,6 +27,8 @@ MAX_CONCURRENT_REQUESTS = 20
 REQUEST_TIMEOUT = 5
 DB_PATH = Path("data/crawler.db")
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+init_db()
 
 _local = threading.local()
 
