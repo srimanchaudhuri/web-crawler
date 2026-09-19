@@ -47,7 +47,55 @@ def _get_connection() -> sqlite3.Connection:
     if not hasattr(_local, "connection"):
         _local.connection = sqlite3.connect(DB_PATH)
         _local.connection.execute("PRAGMA foreign_keys = ON")
+        _local.connection.row_factory = sqlite3.Row
     return _local.connection
+
+def _get_stalled_records_sync() -> list:
+    conn = _get_connection()
+    c = conn.cursor()
+    with conn:
+        c.execute("""
+            SELECT url, status FROM metadata
+            WHERE status = ? OR status = ?
+        """, (Status.processing.value, Status.queued.value))
+
+        result = c.fetchall()
+
+    return result
+
+async def get_stalled_records(loop: asyncio.AbstractEventLoop, executor: ThreadPoolExecutor) -> list:
+    return await loop.run_in_executor(executor, _get_stalled_records_sync)
+
+def _get_finished_records_sync() -> list:
+    conn = _get_connection()
+    c = conn.cursor()
+    with conn:
+        c.execute("""
+            SELECT url, status FROM metadata
+            WHERE status = ? OR status = ?
+        """, (Status.failed.value, Status.processed.value))
+
+        result = c.fetchall()
+
+    return result
+
+async def get_finished_records(loop: asyncio.AbstractEventLoop, executor: ThreadPoolExecutor) -> list:
+    return await loop.run_in_executor(executor, _get_finished_records_sync)
+
+def _is_completed_record_sync(url: str) -> bool:
+    conn = _get_connection()
+    c = conn.cursor()
+    with conn:
+        c.execute("SELECT status FROM metadata WHERE url = ?", (url,))
+        result = c.fetchone()
+
+    if result is None:
+        return False
+
+    return result["status"] in (Status.processed.value, Status.failed.value)
+
+async def is_completed_record(loop: asyncio.AbstractEventLoop, executor: ThreadPoolExecutor, url: str) -> bool:
+    return await loop.run_in_executor(executor, _is_completed_record_sync, url)
 
 def _write_metadata_sync(url: str, status_code: int | None, timestamp: str, status: Status) -> int:
     conn = _get_connection()
@@ -147,8 +195,6 @@ async def get_link_tree(
             await write_metadata(loop, executor, url, None, str(datetime.datetime.now()), Status.processing)
             html, res = await fetch_with_retry(session, url, robot_parser)
 
-            # NEW: guard against _fetch's clean (None, None) return
-            # (robots-disallowed redirect target, or a redirect landing on /robots.txt)
             if html is None or res is None:
                 return None, None
 
@@ -207,11 +253,24 @@ async def link_bfs(
         print(f"Access to {seed_url} is disallowed by robots.txt")
         return []
 
-    queue: deque[asyncio.Task] = deque(
-        [asyncio.create_task(get_link_tree(session, normalize_url(seed_url), robot_parser, executor, loop))]
-    )
+    queue: deque[asyncio.Task] = deque([])
     visited: set[str] = set()
     queued: set[str] = set()
+
+    url_completed = await is_completed_record(loop, executor, seed_url)
+    if not url_completed:
+        queue.append(asyncio.create_task(get_link_tree(session, normalize_url(seed_url), robot_parser, executor, loop)))
+
+    stalled_records = await get_stalled_records(loop, executor)
+    finished_records = await get_finished_records(loop, executor)
+
+    for record in finished_records:
+        visited.add(record["url"])
+
+    for record in stalled_records:
+            task = asyncio.create_task(get_link_tree(session, normalize_url(record["url"]), robot_parser, executor, loop))
+            queue.append(task)
+            queued.add(record["url"])
 
     while queue and len(visited) < MAX_LINKS:
         batch = list(queue)

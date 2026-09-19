@@ -67,6 +67,21 @@ The crawler now includes operational safeguards for real-world site behavior:
 This phase focuses on making the crawler robust enough to keep crawling under
 realistic failures instead of silently stopping at the first error.
 
+### Phase 5: SQLite storage and resumable state - complete
+
+The crawler now persists crawl state and extracted page content in SQLite:
+
+- metadata records for URL, response status, fetch timestamp, and crawl status
+- extracted page text stored separately from request metadata
+- queued, processing, processed, and failed states
+- recovery of queued or interrupted processing records on restart
+- skipping of URLs that have already completed successfully or failed
+- SQLite work dispatched through a thread pool so database I/O does not block
+	the async crawl loop
+
+This phase makes crawl progress durable across process restarts and provides a
+local database for inspecting the collected content.
+
 ## Setup
 
 Install dependencies with [uv](https://docs.astral.sh/uv/):
@@ -83,9 +98,9 @@ uv run python -m web_crawler.main
 
 ## Roadmap
 
-1. SQLite storage and resumable state
-2. Performance benchmarking and tuning
-3. Multi-process crawling and scope control
-4. Distributed crawling and richer scheduling policies
+1. Performance benchmarking and tuning
+2. Multi-process crawling and scope control
+3. Distributed crawling and richer scheduling policies
 
-The original resilience work is now complete as part of Phase 4.
+Phases 1 through 5 are complete. The next milestone is performance
+benchmarking and tuning.
