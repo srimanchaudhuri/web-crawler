@@ -12,7 +12,7 @@ from web_crawler.exception import NonRetryableError, RateLimitedError, Retryable
 from web_crawler.fetcher import fetch_with_retry
 from web_crawler.models import CrawlerConfig, CrawlResult
 from web_crawler.storage import CrawlStorage, Status
-from utils.normalize_url import normalize_url
+from web_crawler.normalize_url import normalize_url
 
 
 class Crawler:
